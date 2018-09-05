@@ -151,7 +151,6 @@ class ModelClass(Model):
         self.name = self._tablename_to_classname(table.name, inflect_engine)
         self.children = []
         self.attributes = OrderedDict()
-        self.table_name = table.name
 
         # Assign attribute names for columns
         for column in table.columns:
@@ -679,7 +678,7 @@ class CodeGenerator(object):
             # Regenerate imports for each model
             model.add_imports(self.collector)
 
-            outfile = io.open(model.table_name + ".py", 'w', encoding='utf-8')
+            outfile = io.open(model.table.name + ".py", 'w', encoding='utf-8')
             if isinstance(model, self.class_model):
                 rendered_model = self.render_class(model)
             elif isinstance(model, self.table_model):
