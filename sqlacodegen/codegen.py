@@ -617,7 +617,12 @@ class CodeGenerator(object):
 
     def render_class(self, model):
         rendered = 'class {0}({1}):\n'.format(model.name, model.parent_name)
-        rendered += '{0}__tablename__ = {1!r}\n'.format(self.indentation, model.table.name)
+        rendered += '{0}__tablename__ = {1!r}\n\n'.format(self.indentation, model.table.name)
+        rendered += '{0}def __init__(self, dictionary=None):\n'.format(self.indentation)
+        rendered += '{0}{0}super({1}, self).__init__()\n'.format(self.indentation, model.name)
+        rendered += '{0}{0}if dictionary is not None:\n'.format(self.indentation)
+        rendered += '{0}{0}{0}for key in dictionary:\n'.format(self.indentation)
+        rendered += '{0}{0}{0}{0}setattr(self, key, dictionary[key])\n'.format(self.indentation)
 
         # Render constraints and indexes as __table_args__
         table_args = []
