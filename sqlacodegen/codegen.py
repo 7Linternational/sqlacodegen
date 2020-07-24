@@ -16,6 +16,7 @@ from sqlalchemy import (
     Enum, ForeignKeyConstraint, PrimaryKeyConstraint, CheckConstraint, UniqueConstraint, Table,
     Column, Float)
 from sqlalchemy.schema import ForeignKey
+from sqlalchemy.sql.sqltypes import NullType
 from sqlalchemy.types import Boolean, String
 from sqlalchemy.util import OrderedDict
 
@@ -24,6 +25,12 @@ try:
     from sqlalchemy import ARRAY
 except ImportError:
     from sqlalchemy.dialects.postgresql import ARRAY
+
+# SQLAlchemy 1.3.11+
+try:
+    from sqlalchemy import Computed
+except ImportError:
+    Computed = None
 
 # Conditionally import Geoalchemy2 to enable reflection support
 try:
@@ -89,7 +96,8 @@ class Model(object):
 
         # Adapt column types to the most reasonable generic types (ie. VARCHAR -> String)
         for column in table.columns:
-            column.type = self._get_adapted_type(column.type, column.table.bind)
+            if not isinstance(column.type, NullType):
+                column.type = self._get_adapted_type(column.type, column.table.bind)
 
     def _get_adapted_type(self, coltype, bind):
         compiled_type = coltype.compile(bind.dialect)
@@ -100,7 +108,12 @@ class Model(object):
                 if supercls is Enum:
                     kw['name'] = coltype.name
 
-                new_coltype = coltype.adapt(supercls)
+                try:
+                    new_coltype = coltype.adapt(supercls)
+                except TypeError:
+                    # If the adaptation fails, don't try again
+                    break
+
                 for key, value in kw.items():
                     setattr(new_coltype, key, value)
 
@@ -136,7 +149,10 @@ class Model(object):
         for column in self.table.columns:
             collector.add_import(column.type)
             if column.server_default:
-                collector.add_literal_import('sqlalchemy', 'text')
+                if Computed and isinstance(column.server_default, Computed):
+                    collector.add_literal_import('sqlalchemy', 'Computed')
+                else:
+                    collector.add_literal_import('sqlalchemy', 'text')
 
             if isinstance(column.type, ARRAY):
                 collector.add_import(column.type.item_type.__class__)
@@ -157,8 +173,22 @@ class Model(object):
             if len(index.columns) > 1:
                 collector.add_import(index)
 
+    @staticmethod
+    def _convert_to_valid_identifier(name):
+        assert name, 'Identifier cannot be empty'
+        if name[0].isdigit() or iskeyword(name):
+            name = '_' + name
+        elif name == 'metadata':
+            name = 'metadata_'
+
+        return _re_invalid_identifier.sub('_', name)
+
 
 class ModelTable(Model):
+    def __init__(self, table):
+        super(ModelTable, self).__init__(table)
+        self.name = self._convert_to_valid_identifier(table.name)
+
     def add_imports(self, collector):
         super(ModelTable, self).add_imports(collector)
         collector.add_import(Table)
@@ -206,16 +236,6 @@ class ModelClass(Model):
         tablename = cls._convert_to_valid_identifier(tablename)
         camel_case_name = ''.join(part[:1].upper() + part[1:] for part in tablename.split('_'))
         return inflect_engine.singular_noun(camel_case_name) or camel_case_name
-
-    @staticmethod
-    def _convert_to_valid_identifier(name):
-        assert name, 'Identifier cannot be empty'
-        if name[0].isdigit() or iskeyword(name):
-            name = '_' + name
-        elif name == 'metadata':
-            name = 'metadata_'
-
-        return _re_invalid_identifier.sub('_', name)
 
     def _add_attribute(self, attrname, value):
         attrname = tempname = self._convert_to_valid_identifier(attrname)
@@ -332,7 +352,7 @@ class CodeGenerator(object):
     def __init__(self, metadata, noindexes=False, noconstraints=False, nojoined=False,
                  noinflect=False, noclasses=False, indentation='    ', model_separator='\n\n',
                  ignored_tables=('alembic_version', 'migrate_version'), table_model=ModelTable,
-                 class_model=ModelClass, template=None):
+                 class_model=ModelClass,  template=None, nocomments=False):
         super(CodeGenerator, self).__init__()
         self.metadata = metadata
         self.noindexes = noindexes
@@ -345,9 +365,10 @@ class CodeGenerator(object):
         self.ignored_tables = ignored_tables
         self.table_model = table_model
         self.class_model = class_model
+        self.nocomments = nocomments
+        self.inflect_engine = self.create_inflect_engine()
         if template:
             self.template = template
-        self.inflect_engine = self.create_inflect_engine()
 
         # Pick association tables from the metadata into their own set, don't process them normally
         links = defaultdict(lambda: [])
@@ -457,7 +478,10 @@ class CodeGenerator(object):
     @staticmethod
     def _getargspec_init(method):
         try:
-            return inspect.getargspec(method)
+            if hasattr(inspect, 'getfullargspec'):
+                return inspect.getfullargspec(method)
+            else:
+                return inspect.getargspec(method)
         except TypeError:
             if method is object.__init__:
                 return ArgSpec(['self'], None, None, None)
@@ -467,30 +491,35 @@ class CodeGenerator(object):
     @classmethod
     def render_column_type(cls, coltype):
         args = []
-        if isinstance(coltype, Enum):
-            args.extend(repr(arg) for arg in coltype.enums)
-            if coltype.name is not None:
-                args.append('name={0!r}'.format(coltype.name))
-        else:
-            # All other types
-            argspec = cls._getargspec_init(coltype.__class__.__init__)
-            defaults = dict(zip(argspec.args[-len(argspec.defaults or ()):],
-                                argspec.defaults or ()))
-            missing = object()
-            use_kwargs = False
-            for attr in argspec.args[1:]:
-                # Remove annoyances like _warn_on_bytestring
-                if attr.startswith('_'):
-                    continue
+        kwargs = OrderedDict()
+        argspec = cls._getargspec_init(coltype.__class__.__init__)
+        defaults = dict(zip(argspec.args[-len(argspec.defaults or ()):],
+                            argspec.defaults or ()))
+        missing = object()
+        use_kwargs = False
+        for attr in argspec.args[1:]:
+            # Remove annoyances like _warn_on_bytestring
+            if attr.startswith('_'):
+                continue
 
-                value = getattr(coltype, attr, missing)
-                default = defaults.get(attr, missing)
-                if value is missing or value == default:
-                    use_kwargs = True
-                elif use_kwargs:
-                    args.append('{0}={1}'.format(attr, repr(value)))
-                else:
-                    args.append(repr(value))
+            value = getattr(coltype, attr, missing)
+            default = defaults.get(attr, missing)
+            if value is missing or value == default:
+                use_kwargs = True
+            elif use_kwargs:
+                kwargs[attr] = repr(value)
+            else:
+                args.append(repr(value))
+
+        if argspec.varargs and hasattr(coltype, argspec.varargs):
+            varargs_repr = [repr(arg) for arg in getattr(coltype, argspec.varargs)]
+            args.extend(varargs_repr)
+
+        if isinstance(coltype, Enum) and coltype.name is not None:
+            kwargs['name'] = repr(coltype.name)
+
+        for key, value in kwargs.items():
+            args.append('{}={}'.format(key, value))
 
         rendered = coltype.__class__.__name__
         if args:
@@ -559,7 +588,16 @@ class CodeGenerator(object):
         elif has_index:
             column.index = True
             kwarg.append('index')
-        if column.server_default:
+
+        if Computed and isinstance(column.server_default, Computed):
+            expression = self._get_compiled_expression(column.server_default.sqltext)
+
+            persist_arg = ''
+            if column.server_default.persisted is not None:
+                persist_arg = ', persisted={}'.format(column.server_default.persisted)
+
+            server_default = 'Computed({!r}{})'.format(expression, persist_arg)
+        elif column.server_default:
             # The quote escaping does not cover pathological cases but should mostly work
             default_expr = self._get_compiled_expression(column.server_default.arg)
             if '\n' in default_expr:
@@ -568,13 +606,15 @@ class CodeGenerator(object):
                 default_expr = default_expr.replace('"', '\\"')
                 server_default = 'server_default=text("{0}")'.format(default_expr)
 
+        comment = getattr(column, 'comment', None)
         return 'Column({0})'.format(', '.join(
             ([repr(column.name)] if show_name else []) +
             ([self.render_column_type(column.type)] if render_coltype else []) +
             [self.render_constraint(x) for x in dedicated_fks] +
             [repr(x) for x in column.constraints] +
             ['{0}={1}'.format(k, repr(getattr(column, k))) for k in kwarg] +
-            ([server_default] if server_default else [])
+            ([server_default] if server_default else []) +
+            (['comment={!r}'.format(comment)] if comment and not self.nocomments else [])
         ))
 
     def render_relationship(self, relationship):
@@ -592,8 +632,8 @@ class CodeGenerator(object):
         return rendered + delimiter.join(args) + end
 
     def render_table(self, model):
-        rendered = 't_{0} = Table(\n{1}{0!r}, metadata,\n'.format(
-            model.table.name, self.indentation)
+        rendered = 't_{0} = Table(\n{2}{1!r}, metadata,\n'.format(
+            model.name, model.table.name, self.indentation)
 
         for column in model.table.columns:
             rendered += '{0}{1},\n'.format(self.indentation, self.render_column(column, True))
@@ -612,6 +652,11 @@ class CodeGenerator(object):
 
         if model.schema:
             rendered += "{0}schema='{1}',\n".format(self.indentation, model.schema)
+
+        table_comment = getattr(model.table, 'comment', None)
+        if table_comment:
+            quoted_comment = table_comment.replace("'", "\\'").replace('"', '\\"')
+            rendered += "{0}comment='{1}',\n".format(self.indentation, quoted_comment)
 
         return rendered.rstrip('\n,') + '\n)\n'
 
@@ -640,6 +685,10 @@ class CodeGenerator(object):
         table_kwargs = {}
         if model.schema:
             table_kwargs['schema'] = model.schema
+
+        table_comment = getattr(model.table, 'comment', None)
+        if table_comment:
+            table_kwargs['comment'] = table_comment
 
         kwargs_items = ', '.join('{0!r}: {1!r}'.format(key, table_kwargs[key])
                                  for key in table_kwargs)
